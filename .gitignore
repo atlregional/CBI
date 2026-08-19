@@ -1,0 +1,12 @@
+# Never commit real credentials
+cbi_credentials.ini
+cbi_azure_credentials.ini
+*.pfx
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# Local output
+outputs/
