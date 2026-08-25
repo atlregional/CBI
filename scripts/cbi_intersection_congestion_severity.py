@@ -886,14 +886,14 @@ def generate_intersection_congestion_severity(connection: psycopg.Connection, ou
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Intersection Congestion Severity — CBI</title>
+<title>Speed Drop Severity in Arterial Roads — CBI</title>
 <style>{_PAGE_CSS}</style>
 </head>
 <body>
 <script>{_CANVAS_MAP_JS}</script>
 <header class="masthead">
   {logo_html}
-  <h1>Intersection Congestion Severity</h1>
+  <h1>Speed Drop Severity in Arterial Roads</h1>
   <p>Alternative methodology &mdash; standalone page. Generated {generated_on}.</p>
 </header>
 <main>

@@ -1,0 +1,703 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{siunitx}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black,citecolor=blue!55!black}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Arterial Congestion and Delay Ranking Methodology}
+\rhead{Methodology Report}
+\cfoot{\thepage}
+\setlength{\headheight}{14pt}
+\setlist[itemize]{leftmargin=1.4em,itemsep=2pt,topsep=4pt}
+\setlist[enumerate]{leftmargin=1.6em,itemsep=3pt,topsep=4pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+\newcommand{\EAVHD}{\mathrm{EAVHD}}
+\newcommand{\HDF}{\mathrm{HDF}}
+\newcommand{\AADT}{\mathrm{AADT}}
+\newcommand{\VFF}{V_{\mathrm{FF}}}
+
+\begin{document}
+
+\begin{titlepage}
+\thispagestyle{empty}
+\centering
+\vspace*{0.18\textheight}
+
+{\large\bfseries METHODOLOGY REPORT\par}
+\vspace{1.35cm}
+
+{\color{blue!35!black}\Huge\bfseries Arterial Congestion and Delay Ranking Methodology\par}
+\vspace{0.55cm}
+
+{\color{blue!55!black}\large\itshape From a Composite Severity Index to Estimated Annual Vehicle-Hours of Delay (EAVHD)\par}
+\vspace{0.8cm}
+
+{\color{blue!45!black}\rule{0.88\textwidth}{0.8pt}\par}
+\vspace{0.75cm}
+{\color{blue!45!black}\rule{0.88\textwidth}{0.8pt}\par}
+
+\vspace{1.55cm}
+
+{\bfseries Author\par}
+\vspace{0.12cm}
+{Soheil Sameti\par}
+
+\vspace{0.75cm}
+
+{\bfseries Date\par}
+\vspace{0.12cm}
+{August 2026\par}
+
+\vfill
+
+{\itshape\small Companion methodology to the CBI Multi-Corridor Technical Report\par}
+\vspace{1.6cm}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Purpose of the Analysis}
+
+The purpose of this analysis is to identify and rank arterial roads in the Atlanta region that experience the most significant recurring congestion and estimated traveler delay.
+
+The analysis uses INRIX/NPMRDS-style probe data. The available database does \textbf{not} contain individual vehicle trajectories or observed hourly traffic counts. Instead, it contains:
+
+\begin{itemize}
+    \item 5-minute speed observations for roadway TMC segments;
+    \item travel time;
+    \item historical average speed;
+    \item reference speed;
+    \item TMC roadway metadata;
+    \item segment length; and
+    \item AADT (Average Annual Daily Traffic).
+\end{itemize}
+
+Because of these limitations, the methodology is built around what probe data measure well: \textbf{when traffic slows, how much it slows, how persistent the condition is, and how much additional travel time results}. AADT is then used as an exposure measure to estimate how many vehicles are affected by that delay.
+
+The final product is intended as a \textbf{regional arterial congestion screening and prioritization tool}. It is not a signal-timing model, an HCM intersection analysis, or a substitute for observed turning-movement counts.
+
+\section{Unit of Analysis: TMC Segments to Named Arterials}
+
+The original INRIX/NPMRDS data are organized by individual TMC roadway segments. Individual TMCs are often too small to represent a meaningful arterial corridor, and the same road can appear under several text variants or route-number combinations.
+
+The workflow therefore has two levels:
+
+\begin{enumerate}
+    \item Calculate congestion and delay measures at the \textbf{individual TMC level}.
+    \item Aggregate TMCs into a curated \textbf{named arterial corridor} before ranking.
+\end{enumerate}
+
+A curated alias registry consolidates fragmented road names and co-signed route descriptions into one canonical road name. This cleanup has already corrected duplicate-corridor cases such as:
+
+\begin{itemize}
+    \item N Druid Hills Rd / N Druid Hills Rd NE;
+    \item Camp Creek Pkwy / Camp Creek Pkwy SW; and
+    \item Windward Pkwy / Windward Pkwy W.
+\end{itemize}
+
+This step matters because duplicate road names can split mileage, EAVHD, congestion pattern, and rank across multiple rows.
+
+The final ranking represents \textbf{named arterial corridors}, not individual intersections. The ``Worst Point'' field is a geographic reference identifying the most problematic location associated with that corridor; it is not the unit being ranked.
+
+\section{Free-Flow Baseline}
+
+A central challenge is defining what counts as uncongested or free-flow operation.
+
+If free-flow speed were calculated independently for every segment using that segment's own best observed conditions, a chronically congested segment could establish an artificially low baseline and therefore appear less abnormal. To avoid that problem, the analysis first identifies a common \textbf{regional free-flow hour}.
+
+\subsection{Regional free-flow hour}
+
+Average speed is calculated by hour of day across all arterial-classified segments, using the arterial functional-class subset. The hour with the highest average arterial speed is selected once for the region.
+
+In the current dataset:
+
+\[
+\boxed{\text{Regional free-flow hour} = 4{:}00\ \mathrm{AM}}
+\]
+
+\subsection{Segment-specific free-flow speed}
+
+The common hour determines \emph{when} free flow is measured, but each segment retains its own baseline speed. For TMC $i$:
+
+\[
+\boxed{V_{\mathrm{FF},i} = V_{i,4\mathrm{AM}}}
+\]
+
+Thus, a road that normally operates near 35 mph is not assigned the same free-flow speed as a road that normally operates near 55 mph. They simply share the same regionally selected reference period.
+
+\section{Congestion Intensity: Speed Reduction}
+
+Congestion intensity measures how severely each segment slows during the main commuting periods.
+
+The current peak windows are:
+
+\[
+AM = 7{:}00\text{--}9{:}00
+\]
+
+\[
+PM = 16{:}00\text{--}18{:}00
+\]
+
+For each TMC, the minimum average speed within the AM or PM peak window is compared with its own free-flow speed.
+
+The speed ratio is:
+
+\[
+\boxed{SpeedRatio_i = \frac{V_{peak,i}}{V_{\mathrm{FF},i}}}
+\]
+
+The reported speed reduction is:
+
+\[
+\boxed{SpeedReduction_i = 1 - SpeedRatio_i}
+\]
+
+For example, if free-flow speed is 40 mph and the relevant peak speed is 20 mph:
+
+\[
+SpeedRatio = \frac{20}{40} = 0.50
+\]
+
+\[
+SpeedReduction = 1 - 0.50 = 50\%
+\]
+
+A larger speed reduction therefore represents more intense congestion.
+
+\section{Recurrence}
+
+Intensity alone cannot distinguish a corridor that is severely congested only on a few unusual days from one that experiences similar congestion nearly every weekday.
+
+A segment is considered to experience significant recurring peak congestion when its peak-period speed falls below 70\% of its free-flow baseline:
+
+\[
+\boxed{V_{peak} < 0.70V_{\mathrm{FF}}}
+\]
+
+Recurrence is the percentage of analyzed weekdays on which that condition occurs.
+
+At the road level, recurrence should be mileage weighted so that very short TMCs do not receive the same influence as long segments:
+
+\[
+\boxed{
+R_{road} = \frac{\sum_i L_i R_i}{\sum_i L_i}
+}
+\]
+
+Many current Top-20 corridors have recurrence values near 100\%. This may legitimately indicate that the worst corridors are congested on nearly every analyzed weekday, but recurrence should also be reviewed across the full set of roads to confirm that the measure is not saturating region-wide.
+
+\section{Why the Original Severity Index Was Reconsidered}
+
+An earlier version of the methodology ranked roads using a composite Severity Index based on queue mile-hours, recurrence, speed reduction, and AADT:
+
+\[
+Severity \propto QueueDensity \times Recurrence \times SpeedReduction \times AADT
+\]
+
+This approach was useful for screening, but it had two major weaknesses:
+
+\begin{enumerate}
+    \item The final score was abstract and had no direct physical interpretation.
+    \item Summed queue burden favored long roads because more mileage created more opportunities to accumulate queue mile-hours.
+\end{enumerate}
+
+The first structural fix was to normalize queue burden by analyzed road mileage. The methodology then moved to a more interpretable impact measure: \textbf{Estimated Annual Vehicle-Hours of Delay (EAVHD)}.
+
+The old Severity Index is now retained only as an experimental comparison field and \textbf{does not determine rank}.
+
+\section{Estimated Annual Vehicle-Hours of Delay (EAVHD)}
+
+The principal delay measure is:
+
+\[
+\boxed{\text{Estimated Annual Vehicle-Hours of Delay (EAVHD)}}
+\]
+
+The construction is \textbf{inspired by the general exposure-weighted excess-travel-time logic used in FHWA performance measures such as PHED}, but it is not the official FHWA PHED metric. The CBI implementation uses a segment-specific free-flow baseline and the available INRIX/NPMRDS data structure.
+
+The idea is straightforward:
+
+\begin{quote}
+Estimate the additional travel time experienced under observed conditions relative to free flow, estimate the number of vehicles exposed to those conditions, and accumulate that delay across the analysis period.
+\end{quote}
+
+\section{Excess Travel Time}
+
+For segment $i$ of length $L_i$:
+
+\[
+TT_{obs,i} = \frac{L_i}{V_{obs,i}}
+\]
+
+and:
+
+\[
+TT_{FF,i} = \frac{L_i}{V_{\mathrm{FF},i}}
+\]
+
+Excess travel time is therefore:
+
+\[
+\boxed{
+ETT_{i,h,d} = L_i \times \max\left(0,\frac{1}{V_{obs,i,h,d}} - \frac{1}{V_{\mathrm{FF},i}}\right)
+}
+\]
+
+where $h$ is hour of day and $d$ is analyzed weekday.
+
+The $\max(0,\cdot)$ term prevents speeds above the free-flow baseline from creating negative delay.
+
+This is a \textbf{continuous delay measure}. It differs intentionally from recurrence:
+
+\begin{itemize}
+    \item \textbf{Recurrence} uses the 70\% threshold to describe how frequently severe congestion occurs.
+    \item \textbf{EAVHD} measures excess travel time whenever observed travel time exceeds the free-flow benchmark.
+\end{itemize}
+
+\section{The Missing Hourly-Volume Problem}
+
+INRIX/NPMRDS probe data provide detailed temporal speed and travel-time observations, but the current database does not contain observed hourly traffic volume.
+
+The metadata include AADT:
+
+\[
+AADT = \text{Average Annual Daily Traffic}
+\]
+
+AADT does not identify how many vehicles travel in a particular hour. Therefore, hourly traffic exposure must currently be estimated.
+
+\section{Hourly Distribution Factor (HDF)}
+
+Estimated directional hourly volume is:
+
+\[
+\boxed{
+\hat V_{i,h} = AADT_i \times HDF_h \times D
+}
+\]
+
+where:
+
+\begin{itemize}
+    \item $AADT_i$ is the AADT of TMC $i$;
+    \item $HDF_h$ is the modeled fraction of daily traffic occurring in hour $h$; and
+    \item $D$ is the directional split.
+\end{itemize}
+
+The current HDF comes from the Delaware Department of Transportation Traffic Monitoring Program, \emph{Hourly Distribution of AADT for Traffic Groups} (Average Weekday Traffic, 2002).
+
+The available table contained seven populated traffic-pattern groups plus one empty group. Because the available source did not include a sufficiently clear group-to-facility legend to confidently select one column as the correct Atlanta urban-arterial profile, the primary curve uses the average of the seven populated groups.
+
+This is explicitly treated as a \textbf{modeled assumption}, not as an observed Atlanta hourly volume profile.
+
+\section{Directional Split}
+
+The probe TMCs are directional, but the current database does not provide hourly directional traffic counts. The analysis therefore uses:
+
+\[
+\boxed{D = 0.50}
+\]
+
+This assumes that half of the daily roadway traffic belongs to each direction.
+
+The 50/50 factor is a transparent neutral approximation, not a claim that every Atlanta arterial is directionally balanced. It should be replaced if reliable directional count information becomes available.
+
+\section{Calculating EAVHD}
+
+For each TMC, hour, and analyzed weekday:
+
+\[
+\boxed{
+Delay_{i,h,d} = ETT_{i,h,d} \times \hat V_{i,h}
+}
+\]
+
+This quantity is measured in vehicle-hours of excess travel time.
+
+The segment total is:
+
+\[
+\boxed{
+EAVHD_i = \sum_d \sum_h ETT_{i,h,d}\hat V_{i,h}
+}
+\]
+
+The road total is then:
+
+\[
+\boxed{
+EAVHD_{road} = \sum_{i\in road} EAVHD_i
+}
+\]
+
+Each TMC should use its \textbf{own segment-level AADT} in the EAVHD calculation. Median AADT at the road level is only a descriptive statistic shown in the output table.
+
+\section{Total EAVHD Versus EAVHD Density}
+
+Total EAVHD measures overall estimated traveler burden, but raw totals naturally increase with corridor length. A 40-mile road has many more miles over which delay can accumulate than a 2-mile road.
+
+Therefore, the ranking uses delay density:
+
+\[
+\boxed{
+EAVHD_{density} = \frac{EAVHD_{road}}{AnalyzedRoadMiles}
+}
+\]
+
+with units:
+
+\[
+\boxed{\text{estimated vehicle-hours of delay per mile}}
+\]
+
+This removes the direct accumulation advantage associated with longer corridors and expresses delay burden on a per-mile basis.
+
+The two outputs answer different questions:
+
+\begin{description}[leftmargin=2.3cm,style=nextline]
+    \item[Total EAVHD] How much total estimated traveler delay does this road generate?
+    \item[EAVHD per mile] How concentrated is the estimated delay burden along this road?
+\end{description}
+
+\section{Final Ranking Variable}
+
+The ranking is explicitly:
+
+\[
+\boxed{Rank = Descending(EAVHD_{density})}
+\]
+
+It is \textbf{not} ranked by the experimental Severity Index. This is why the Severity Index column does not appear in descending order.
+
+For public reporting, the Severity Index should eventually be removed from the main ranking table or moved to a separate validation/comparison table.
+
+\section{Congestion Operating Patterns (COPs)}
+
+A separate analysis describes \textbf{what type of congestion pattern} each road exhibits. These categories are called Congestion Operating Patterns (COPs).
+
+For each TMC, a normalized 24-hour speed profile is created:
+
+\[
+\boxed{
+R_{i,h} = \frac{V_{i,h}}{V_{\mathrm{FF},i}}
+}
+\]
+
+This allows roads with different absolute speeds to be compared on the basis of temporal congestion shape.
+
+K-means and hierarchical clustering were tested for multiple values of $k$. The best tested result was:
+
+\[
+\boxed{\text{K-means, }k=4,\ \text{silhouette}=0.293}
+\]
+
+Other tested results included:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Method & $k$ & Silhouette \\
+\midrule
+K-means & 4 & 0.293 \\
+Hierarchical & 4 & 0.280 \\
+K-means & 5 & 0.275 \\
+Hierarchical & 5 & 0.206 \\
+K-means & 6 & 0.267 \\
+Hierarchical & 6 & 0.216 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The selected four-cluster solution produced approximately:
+
+\begin{itemize}
+    \item 270 mostly uncongested segments;
+    \item 1,000 PM-dominant segments;
+    \item 902 irregular/mixed-pattern segments; and
+    \item 664 all-day urban congestion segments.
+\end{itemize}
+
+Because the silhouette score is modest, COPs should be interpreted as \textbf{descriptive archetypes}, not sharply separated natural regimes.
+
+Examples in the current ranking include:
+
+\begin{itemize}
+    \item COP-1 - All-Day Urban;
+    \item COP-2 - PM-Dominant; and
+    \item COP-5 - Irregular/Mixed.
+\end{itemize}
+
+COP is a diagnostic field only and does not affect EAVHD or rank.
+
+\section{Why COP Is Not Used as an HDF}
+
+The separation between COP and HDF is deliberate.
+
+INRIX probe data tell us how \textbf{speed} changes throughout the day. They do not tell us how \textbf{traffic volume} is distributed throughout the day.
+
+A strong PM speed decline does not imply that a known percentage of AADT occurs in the PM. Near capacity, speed may fall while actual throughput also falls.
+
+Therefore:
+
+\[
+\boxed{\text{Speed profile} \neq \text{Volume profile}}
+\]
+
+The Atlanta COP classification is not used to manufacture a traffic-volume distribution.
+
+\section{HDF Sensitivity Testing}
+
+Because the HDF is an acknowledged modeling assumption, the entire EAVHD-density ranking was recalculated under alternative published hourly-distribution shapes.
+
+The results were highly stable:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Scenario & Spearman rank correlation & Top-20 overlap \\
+\midrule
+Flatter published curve & 0.999 & 20/20 \\
+More sharply peaked curve & 1.000 & 19/20 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These results do \textbf{not} prove that the absolute EAVHD values are exact. They demonstrate that the \textbf{relative ranking is highly insensitive to the particular reasonable published HDF curve tested}.
+
+Accordingly, confidence should be stated separately:
+
+\[
+\boxed{\text{Relative ranking: robust under tested HDF alternatives}}
+\]
+
+\[
+\boxed{\text{Absolute EAVHD magnitude: modeled / estimated}}
+\]
+
+\section{Road-Name Quality Control}
+
+Road-name normalization is a substantive part of the methodology because alias fragmentation can distort total mileage, EAVHD, delay density, and rank.
+
+After alias cleanup, for example:
+
+\begin{itemize}
+    \item N Druid Hills Road became one approximately 8.0-mile analyzed corridor rather than two separate ranked entries.
+    \item Camp Creek Parkway became one approximately 9.7-mile corridor rather than occupying two positions in the Top 20.
+\end{itemize}
+
+Canonical road grouping should therefore be reviewed whenever duplicate or near-duplicate road names appear in the rankings.
+
+\section{Short-Corridor Denominator Problem}
+
+Length normalization fixes the bias toward very long roads, but it introduces the opposite potential artifact:
+
+\[
+Density = \frac{EAVHD}{Miles}
+\]
+
+can become unstable when the denominator is extremely small.
+
+GA-205 exposed this issue. It contains only two TMCs totaling approximately 0.538 miles, with total EAVHD of roughly 29,782 vehicle-hours. Dividing by the small denominator produces approximately 55,380 vehicle-hours per mile, enough to place the road near the Top 20.
+
+By contrast, GA-11 contains 15 TMCs across approximately 8.06 miles and produces roughly 446,396 vehicle-hours, or about 55,410 vehicle-hours per mile. The two densities are nearly identical, but the amount of corridor evidence supporting them is very different.
+
+\section{Delay-Concentration Quality Control}
+
+A useful internal QC statistic is the share of corridor EAVHD contributed by the single largest TMC:
+
+\[
+\boxed{
+MaxTMCShare = \frac{\max(EAVHD_i)}{EAVHD_{road}}
+}
+\]
+
+For GA-11, the largest TMC contributes only about 16.7\% of corridor EAVHD, indicating that the burden is distributed across many segments.
+
+For GA-205, one TMC contributes about 82.6\% of the total, indicating that the result is dominated by one localized bottleneck rather than broad corridor-wide evidence.
+
+A preliminary QC flag can therefore be defined as:
+
+\[
+\boxed{MaxTMCShare > 0.60}
+\]
+
+This should initially be used as a \textbf{review flag}, not an automatic exclusion rule.
+
+\section{Proposed Corridor Eligibility Rule}
+
+Rather than manually deleting suspicious roads, an objective coverage rule should determine whether a named road has sufficient evidence to be ranked as a corridor.
+
+The proposed rule is:
+
+\[
+\boxed{
+Miles \ge 0.5
+\quad \text{AND} \quad
+(Miles \ge 1.0\ \text{OR}\ N_{TMC}\ge4)
+}
+\]
+
+This rule is designed to preserve genuinely short but well-represented urban corridors while excluding tiny fragments supported by only one or two TMCs.
+
+Examples:
+
+\begin{itemize}
+    \item A 0.7-mile downtown corridor represented by six TMCs can remain eligible.
+    \item A 5-mile road represented by three long TMCs can remain eligible.
+    \item A 0.54-mile road represented by only two TMCs, such as the current GA-205 case, would not qualify for the corridor ranking.
+\end{itemize}
+
+This is preferable to manually removing roads because they do not ``look right.''
+
+\section{GA-11 and GA-205 Diagnostic Example}
+
+The detailed QC review of GA-11 and GA-205 illustrates why support size and delay concentration matter.
+
+\subsection{GA-11}
+
+GA-11 contains 15 TMCs covering approximately 8.06 miles. Several substantial TMCs independently show severe speed deterioration, with multiple speed ratios in roughly the 0.40--0.51 range. Multiple segments independently contribute tens of thousands of estimated vehicle-hours.
+
+Its largest segment contributes only about 16.7\% of total corridor EAVHD. This supports interpretation as a \textbf{distributed corridor-level congestion problem}.
+
+\subsection{GA-205}
+
+GA-205 contains only two TMCs totaling approximately 0.54 mile. One direction is relatively mild while the other is severely degraded, and approximately 82.6\% of total corridor EAVHD comes from a single short TMC.
+
+The congestion may be real, but the available coverage is more consistent with a \textbf{localized bottleneck} than with a robust named-corridor ranking. Under the proposed eligibility rule, GA-205 would be excluded from the corridor ranking without any manual exception.
+
+\section{Remaining Recurrence Audit}
+
+One specific QC issue remains to be checked. A GA-205 TMC had an aggregate peak speed ratio around 0.797 while its reported recurrence was 100\%.
+
+These statistics are not necessarily impossible because they may use different temporal aggregations, but the implementation should be verified to ensure recurrence is exactly:
+
+\[
+\boxed{
+\frac{\text{valid weekdays whose defined peak statistic is below }0.70V_{\mathrm{FF}}}
+{\text{all valid analyzed weekdays}}
+}
+\]
+
+and not accidentally based on whether \emph{any} individual 5-minute observation within a peak period crossed the threshold.
+
+The recurrence distribution should also be summarized across all named arterials, not only the Top 20.
+
+\section{What the Methodology Can and Cannot Claim}
+
+The analysis can reasonably claim to use observed INRIX probe data to characterize:
+
+\begin{itemize}
+    \item speed deterioration;
+    \item temporal congestion patterns;
+    \item recurrence;
+    \item excess travel time;
+    \item spatial concentration of congestion; and
+    \item relative arterial delay burden.
+\end{itemize}
+
+It can also estimate traffic exposure using segment-level AADT.
+
+However, EAVHD should \textbf{not} be described as directly measured vehicle-hours of delay because hourly and directional traffic volumes are modeled rather than observed.
+
+The word \textbf{Estimated} is therefore essential. Absolute values depend partly on the chosen HDF and the current $D=0.50$ assumption.
+
+\section{Plain-Language Workflow Summary}
+
+The complete process can be summarized as follows:
+
+\begin{enumerate}
+    \item \textbf{Observe traffic conditions.} Use INRIX/NPMRDS probe speeds for arterial TMCs.
+    \item \textbf{Establish a common free-flow period.} Identify the hour when the regional arterial system collectively operates fastest; currently 4 AM.
+    \item \textbf{Establish individual segment baselines.} Use each TMC's own speed at that regional free-flow hour.
+    \item \textbf{Measure congestion intensity.} Compare peak-period speeds with each segment's free-flow baseline.
+    \item \textbf{Measure recurrence.} Determine how frequently weekday peak speeds fall below 70\% of free flow.
+    \item \textbf{Calculate excess travel time.} Compute observed travel time minus free-flow travel time for each segment and hour.
+    \item \textbf{Estimate hourly traffic exposure.} Convert segment AADT into estimated directional hourly volume using HDF and $D=0.50$.
+    \item \textbf{Calculate EAVHD.} Multiply excess travel time by estimated traffic exposure and accumulate across weekdays.
+    \item \textbf{Build named corridors.} Combine TMCs under canonical road names.
+    \item \textbf{Measure total impact.} Sum segment EAVHD to obtain road-level total EAVHD.
+    \item \textbf{Normalize for road length.} Divide total EAVHD by analyzed road miles.
+    \item \textbf{Apply corridor coverage QC.} Exclude tiny, poorly represented fragments from the named-corridor ranking.
+    \item \textbf{Rank eligible roads.} Sort from highest to lowest EAVHD per mile.
+    \item \textbf{Describe congestion type.} Assign a descriptive COP based on normalized 24-hour speed shape.
+    \item \textbf{Test robustness.} Re-run the ranking under alternate published HDF curves and compare ranks using Spearman correlation and Top-20 overlap.
+\end{enumerate}
+
+\section{Recommended Public Interpretation}
+
+The final ranking should be described as:
+
+\begin{quote}
+\textbf{A ranking of Atlanta-region arterial corridors by estimated annual vehicle-delay burden per analyzed roadway mile.}
+\end{quote}
+
+It should not be described as a ranking of the worst intersections, because the unit of analysis is the named arterial corridor.
+
+Both total and density measures should be retained:
+
+\[
+\boxed{EAVHD_{total}}
+\]
+
+for \textbf{total regional impact}, and
+
+\[
+\boxed{EAVHD_{density}}
+\]
+
+for \textbf{congestion concentration and ranking}.
+
+\section{Current Assessment and Remaining Work}
+
+The methodology has evolved from an abstract composite severity score into a more interpretable exposure-weighted delay framework. Its strongest components are:
+
+\begin{itemize}
+    \item INRIX-derived speed and travel-time observations;
+    \item a consistent region-wide free-flow reference hour with segment-specific baseline speeds;
+    \item road-name canonicalization;
+    \item segment-level EAVHD aggregation;
+    \item length normalization; and
+    \item strong rank stability under alternate published HDF assumptions.
+\end{itemize}
+
+The largest remaining uncertainty is not the relative ranking itself; the sensitivity testing indicates that ranking is highly stable under the HDF alternatives tested. The larger uncertainty is the \textbf{absolute magnitude of EAVHD}, because hourly and directional traffic volumes are estimated rather than directly observed.
+
+The next quality-control steps are therefore:
+
+\begin{enumerate}
+    \item implement the corridor eligibility rule;
+    \item retain TMC count and maximum-TMC EAVHD share as QC fields;
+    \item verify the recurrence calculation and full-network recurrence distribution;
+    \item continue canonical road-name cleanup; and
+    \item eventually replace the current HDF and directional assumptions if reliable Atlanta/Georgia continuous-count data become available.
+\end{enumerate}
+
+Once these checks are complete, the methodology is defensible as a \textbf{regional arterial congestion screening and prioritization framework} based primarily on INRIX/NPMRDS probe observations and segment-level AADT.
+
+\section*{References and Data Sources}
+\addcontentsline{toc}{section}{References and Data Sources}
+
+\begin{itemize}
+    \item INRIX/NPMRDS-style probe readings and TMC metadata used in the CBI arterial analysis database.
+    \item Delaware Department of Transportation, Traffic Monitoring Program. \emph{Hourly Distribution of AADT for Traffic Groups}, Average Weekday Traffic, 2002. Used as the current modeled hourly traffic-distribution input and tested against alternate published curves.
+    \item Federal Highway Administration performance-measure methodology, including PHED concepts based on excess travel time and estimated traffic exposure. The CBI EAVHD measure is an adaptation of the general construction, not the federal PHED metric itself.
+\end{itemize}
+
+\end{document}

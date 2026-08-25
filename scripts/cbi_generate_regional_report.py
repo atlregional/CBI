@@ -699,6 +699,91 @@ def _load_ranked_bottlenecks_detailed(corridor: CorridorContext) -> pl.DataFrame
     )
 
 
+def _load_ranked_segments_by_intersection(corridor: CorridorContext) -> pl.DataFrame:
+    """
+    Per-exit breakdown for corridors in _MULTI_BOTTLENECK_CORRIDORS (Downtown
+    Connector Northbound/Southbound): the real bottleneck-detection pipeline
+    (cbi_corridor_bottlenecks.py) collapses these into a single capped-width
+    bottleneck because their occurrence is a near-flat 94-99% plateau across
+    nearly the whole corridor (see the "multiple severity bottlenecks"
+    annotation on the network-wide ranking) — there is no discrete peak for
+    scipy.signal.find_peaks to find. This bypasses that detection pipeline
+    entirely for display purposes ONLY, in exactly this corridor's own
+    detail table: consecutive TMCs sharing the same tmc_metadata
+    `intersection` (named exit) are grouped directly from segment_profile,
+    each becoming one row scored the same shape as the real severity_index
+    (occurrence x annual queue mile-hours x speed drop) so the ranked table
+    and its severity chart show every named exit instead of one blob. Not
+    used for the network-wide Top Bottlenecks ranking, the Region Map, or
+    any other corridor — deliberately scoped to just this corridor's own
+    table (see _corridor_detail_block).
+    """
+    return pl.read_database_uri(
+        query=f"""
+            WITH exit_segments AS (
+                SELECT segment_order, tmc, intersection, weekday_occurrence_pct,
+                       annual_segment_mile_hours, average_congested_speed_ratio
+                FROM "Year_2025".segment_profile
+                WHERE corridor_id = {corridor.corridor_id} AND intersection IS NOT NULL
+            ),
+            by_intersection AS (
+                SELECT intersection,
+                       MAX(weekday_occurrence_pct) AS occurrence_pct,
+                       SUM(annual_segment_mile_hours) AS annual_queue_mile_hours,
+                       AVG(average_congested_speed_ratio) AS avg_congested_speed_ratio
+                FROM exit_segments
+                GROUP BY intersection
+            ),
+            severity AS (
+                SELECT *,
+                    (occurrence_pct / 100.0) * annual_queue_mile_hours
+                    * (1.0 - COALESCE(avg_congested_speed_ratio, 0.0)) AS severity_index
+                FROM by_intersection
+            ),
+            peak_ctx AS (
+                SELECT DISTINCT ON (es.intersection) es.intersection, t.county, t.aadt
+                FROM exit_segments es
+                JOIN "Year_2025".tmc_metadata t ON t.tmc = es.tmc
+                ORDER BY es.intersection, es.segment_order
+            ),
+            congested AS (
+                SELECT es.intersection,
+                       EXTRACT(HOUR FROM p.measurement_tstamp)::integer AS hour,
+                       EXTRACT(ISODOW FROM p.measurement_tstamp)::integer AS dow
+                FROM exit_segments es
+                JOIN "Year_2025".probe_readings p ON p.tmc_code = es.tmc
+                WHERE p.speed IS NOT NULL AND p.reference_speed > 0
+                  AND p.speed < 0.70 * p.reference_speed
+            ),
+            hour_ranked AS (
+                SELECT intersection, hour,
+                       ROW_NUMBER() OVER (PARTITION BY intersection ORDER BY COUNT(*) DESC) AS rn
+                FROM congested GROUP BY intersection, hour
+            ),
+            dow_ranked AS (
+                SELECT intersection, dow,
+                       ROW_NUMBER() OVER (PARTITION BY intersection ORDER BY COUNT(*) DESC) AS rn
+                FROM congested GROUP BY intersection, dow
+            )
+            SELECT
+                RANK() OVER (ORDER BY sv.severity_index DESC) AS severity_rank,
+                sv.intersection AS representative_intersection,
+                sv.occurrence_pct, sv.annual_queue_mile_hours, sv.avg_congested_speed_ratio,
+                sv.severity_index, pc.county, pc.aadt,
+                TO_CHAR(make_time(h.hour, 0, 0), 'HH12:00 AM') AS peak_hour_label,
+                (ARRAY['Monday', 'Tuesday', 'Wednesday', 'Thursday',
+                       'Friday', 'Saturday', 'Sunday'])[d.dow] AS peak_weekday_name
+            FROM severity AS sv
+            LEFT JOIN peak_ctx AS pc ON pc.intersection = sv.intersection
+            LEFT JOIN hour_ranked AS h ON h.intersection = sv.intersection AND h.rn = 1
+            LEFT JOIN dow_ranked AS d ON d.intersection = sv.intersection AND d.rn = 1
+            ORDER BY severity_rank
+        """,
+        uri=cbi_database.database_uri(),
+        engine="connectorx",
+    )
+
+
 def _load_corridor_map_segments() -> pl.DataFrame:
     """Interstate + Expressway + Arterial segments with their severity metric,
     for the region map's colored traces and each corridor's mini-map."""
@@ -982,15 +1067,11 @@ def _build_region_map_html(
         "at a discrete, repeatable location, or falls back to a segment-by-segment profile "
         "instead (see that corridor's own section in the Corridors tab).</p>"
         "<p>Collector and Local roads don't go through bottleneck detection (too few "
-        "multi-segment corridors exist), so they aren't shown on this map — see the Watch "
-        "Segments tab for their lighter occurrence-based summary instead.</p>"
+        "multi-segment corridors exist), so they aren't shown on this map.</p>"
         "<p>The Corridors tab's severity index is a different, more complete score than plain "
         "occurrence: it multiplies occurrence rate by annual queue mile-hours and by how much "
         "speed drops, then scales by traffic volume (AADT) — that AADT-weighted figure is "
         "exactly what's clustered here for the bottleneck layer's color.</p>"
-        "<p>Line geometry is drawn straight between each TMC segment's endpoint coordinates — "
-        "the source data has no curved road shapes, so tight curves and interchange ramps are "
-        "approximated as straight segments rather than traced exactly.</p>"
         "</div>"
     )
 
@@ -1126,7 +1207,27 @@ def _kv_table(rows: list[tuple[str, str]]) -> str:
     return f"<table class='kv'>{body}</table>"
 
 
-def _bottleneck_table(ranked: pl.DataFrame) -> str:
+#  Downtown Connector Northbound/Southbound (I-75/I-85 through downtown) run
+#  94-99% occurrence across nearly their whole length — a genuine, near-flat
+#  plateau, not a data bug — so peak-detection can only ever surface one
+#  capped-width bottleneck per direction covering many named exits at once,
+#  instead of one per exit. Splitting that into per-exit rows would flood
+#  the region-wide Top Bottlenecks ranking with ~20 Downtown Connector
+#  entries and crowd out every other corridor, so the single row per
+#  direction stays — this just labels it so it isn't mistaken for a true
+#  single-point bottleneck the way every other row in these tables is.
+_MULTI_BOTTLENECK_CORRIDORS = {"Downtown Connector Northbound", "Downtown Connector Southbound"}
+_MULTI_BOTTLENECK_NOTE = " — multiple severity bottlenecks along this corridor"
+
+
+def _location_label(intersection: str | None, corridor_name: str | None) -> str:
+    label = str(intersection or "")
+    if corridor_name in _MULTI_BOTTLENECK_CORRIDORS:
+        label += _MULTI_BOTTLENECK_NOTE
+    return label
+
+
+def _bottleneck_table(ranked: pl.DataFrame, corridor_name: str | None = None) -> str:
     if ranked.is_empty():
         return (
             "<p class='muted'>No single location stood out as a discrete recurring "
@@ -1144,7 +1245,7 @@ def _bottleneck_table(ranked: pl.DataFrame) -> str:
     rows = "".join(
         "<tr>"
         f"<td>{row['severity_rank']}</td>"
-        f"<td>{html.escape(str(row['representative_intersection'] or ''))}</td>"
+        f"<td>{html.escape(_location_label(row['representative_intersection'], corridor_name))}</td>"
         f"<td>{html.escape(str(row['county'] or '-'))}</td>"
         f"<td>{row['aadt'] or '-'}</td>"
         f"<td>{_fmt2(row['occurrence_pct'])}%</td>"
@@ -1862,7 +1963,6 @@ def _build_metadata_tab_html(counts: dict) -> str:
     )
 
     groups = counts["corridors_by_group"]
-    watch = counts["watch_by_class"]
     date_range = (
         f"{counts['date_min'].isoformat()} to {counts['date_max'].isoformat()} "
         f"({counts['date_count']} analyzed days)"
@@ -1878,7 +1978,7 @@ def _build_metadata_tab_html(counts: dict) -> str:
             f"({counts['probe_min'].date().isoformat()} – {counts['probe_max'].date().isoformat()})",
         ),
         (
-            "Speed observations analyzed for this report (corridors + watch segments)",
+            "Speed observations analyzed for this report",
             _int(counts["probe_analyzed"]),
         ),
         (
@@ -1888,11 +1988,6 @@ def _build_metadata_tab_html(counts: dict) -> str:
             f"{groups.get('Arterial', 0)} Arterial)",
         ),
         ("Corridor segments analyzed", _int(counts["segments_total"])),
-        (
-            "Watch-list segments (lighter per-segment summary)",
-            f"{_int(counts['watch_total'])} "
-            f"({watch.get('Collector', 0)} Collector, {watch.get('Local', 0)} Local)",
-        ),
         ("Congestion events detected", _int(counts["events_total"])),
         ("Recurring bottlenecks identified", _int(counts["bottlenecks_total"])),
         ("Daily bottleneck characterization records", _int(counts["daily_metrics_total"])),
@@ -1908,8 +2003,7 @@ def _build_metadata_tab_html(counts: dict) -> str:
       <h3>What this report is</h3>
       <p>This is the Atlanta Regional Commission's (ARC) CBI regional congestion report: an
       automated, data-driven analysis of recurring traffic congestion across Interstates,
-      Arterials, and a watch list of the busiest Collector and Local roads in ARC's
-      21-county metro Atlanta planning area. It is built directly from 5-minute interval
+      Arterials in ARC's 21-county metro Atlanta planning area. It is built directly from 5-minute interval
       probe vehicle speed data, not survey or anecdotal input — every number in the other
       tabs traces back to the record counts below.</p>
 
@@ -1928,7 +2022,9 @@ def _build_metadata_tab_html(counts: dict) -> str:
         specific corridor network, data sources, and reporting needs. Per the CBI Tool
         Software License Agreement, this adaptation is plainly identified here as an
         altered version of the FHWA CBI concept, not a redistribution of the original
-        software, and FHWA / the U.S. Government do not endorse this implementation.
+        software, and FHWA / the U.S. Government do not endorse this implementation. For the
+        full technical write-up, see the <a href="CBI_Technical_Report.pdf" target="_blank"
+        rel="noopener noreferrer">CBI Technical Report</a> document.
       </div>
 
       <h3>Data source</h3>
@@ -2025,10 +2121,72 @@ def _build_metadata_tab_html(counts: dict) -> str:
         multiplies severity_index by (peak-segment AADT &divide; 100,000 — close to the median AADT
         across ranking-eligible bottlenecks), leaving a typical-volume bottleneck roughly unchanged
         while discounting low-volume ones and boosting high-volume ones proportional to actual
-        vehicles affected. This is what the region-wide ranking, the Intersection Severity Index,
-        and the region map's color classification are now ordered/clustered by — severity_index
-        itself is unchanged and still shown alongside for methodological transparency against the
-        FHWA-attributed original formula.
+        vehicles affected. This is what the region-wide ranking and the region map's color
+        classification are now ordered/clustered by — severity_index itself is unchanged and
+        still shown alongside for methodological transparency against the FHWA-attributed
+        original formula.
+      </div>
+
+      <div class="attribution-box">
+        <strong>Top Arterials by Estimated Vehicle-Delay Density (EAVHD), Arterial Roads.</strong>
+        A separate ranking, anchored to FHWA's PHED (Peak Hour Excessive Delay) construction,
+        which is itself built from NPMRDS travel times plus a traffic-volume estimate. For every
+        segment, hour, and analyzed weekday: excess travel time ETT = segment length &times;
+        max(0, 1/observed speed &minus; 1/free-flow speed), in hours, using that segment's own
+        AADT (not a road-level median — median AADT is used only for display) to estimate hourly
+        directional volume V&#770; = AADT &times; HDF (hourly distribution factor, the modeled %
+        of daily traffic in that hour) &times; D (directional split). Estimated vehicle-hours of
+        delay = ETT &times; V&#770;, summed to an annual per-segment total, then summed across
+        every segment of a named road (e.g. Buford Hwy, GA-42, N Druid Hills Rd) to get
+        EAVHD<sub>total</sub> for the whole road. <strong>Rank is by EAVHD<sub>density</sub> =
+        EAVHD<sub>total</sub> &divide; the road's own analyzed length in miles</strong> — a
+        congestion-CONCENTRATION measure, not total regional burden: a long rural or exurban
+        route can accumulate far more TOTAL delay than a short, severely-congested in-town
+        corridor while having a fraction of its DENSITY, so this tab answers "how concentrated"
+        rather than "how much in total."
+        <br /><br />
+        <strong>Corridor eligibility</strong> is checked before ranking: a road must have
+        road_miles &ge; 0.5 AND (road_miles &ge; 1.0 OR at least 4 supporting TMCs) to be ranked
+        at all — a road that is both very short and thinly supported is excluded outright, since
+        its density figure divides by a near-zero denominator and is not a meaningfully
+        comparable "corridor" measurement (confirmed directly: GA-205, 0.54 mi on just 2 TMCs
+        with 82.6% of its own delay concentrated in one of them, fails this test; GA-11, 8.06 mi
+        on 15 TMCs, passes). Every eligible road's own worst TMC is separately checked: max TMC
+        share of delay = max<sub>i</sub>(EAVHD<sub>i</sub>) &divide; EAVHD<sub>total</sub> — a
+        road can pass eligibility and still have most of its delay concentrated in one segment
+        (flagged, not excluded, in the ranked table) rather than spread across the corridor.
+        Recurrence and speed reduction are LENGTH-WEIGHTED averages across a road's segments
+        (not a plain mean), so a handful of short TMC fragments don't carry the same influence
+        as long ones. Recurrence itself is measured from each day's worst PEAK-HOUR AVERAGE
+        speed, not its worst single 5-minute reading — an earlier version of this calculation
+        checked any 5-minute dip within the peak window, which inflated recurrence toward
+        saturation across nearly every segment; anchoring to the hourly average fixed that.
+        <br /><br />
+        On <strong>"Estimated"</strong>: this database has no observed hourly traffic volume —
+        only AADT (an annual daily average per segment). The primary hourly distribution factor
+        (HDF) is a real, published, count-station-derived curve (Delaware DOT Traffic Monitoring
+        Program, "Hourly Distribution of AADT for Traffic Groups," Average Weekday Traffic,
+        2002 — averaged across that source's 7 populated traffic-pattern groups, since its
+        group-to-facility-type legend was not available to confirm which column is specifically
+        "urban arterial"), not a fabricated one, but it is still the least-defensible input to
+        EAVHD and the first thing to replace with real GDOT continuous-count-station hourly
+        profiles once available. To test how much that assumption actually matters, EAVHD
+        density was recomputed under 3 alternate plausible hourly-distribution scenarios (a
+        flatter real curve, a uniform 1/24-per-hour baseline, and a synthetic AM+PM commuter
+        double-peak) and compared to the primary ranking — Spearman's &rho; came back in the
+        0.995&ndash;0.999 range with 19&ndash;20 of the same 20 roads staying in the top 20
+        regardless of scenario, demonstrating the ranking is stable under alternative reasonable
+        hourly distributions rather than an artifact of exactly which curve was chosen (see the
+        Top Arterials tab for the live numbers). A Congestion Pattern (COP) diagnostic column
+        also classifies each road by the SHAPE of its own INRIX-observed congestion — deliberately
+        NOT called a Traffic Pattern Group, since that term already means a volume/count concept
+        in traffic engineering, and speed shape cannot be reliably converted into a
+        traffic-volume distribution — shown for context only, and does not affect ranking or
+        select a different HDF curve per road. The prior severity_index-based scoring for this
+        ranking is kept in the table only as an experimental comparison column, slated for
+        removal once EAVHD<sub>density</sub> is fully validated. For the full technical
+        write-up, see the <a href="Intersection_Congestion_Ranking.pdf" target="_blank"
+        rel="noopener noreferrer">Intersection Congestion Ranking</a> document.
       </div>
 
       <h3>How this helps ARC</h3>
@@ -2042,104 +2200,237 @@ def _build_metadata_tab_html(counts: dict) -> str:
     """
 
 
-def _load_intersection_severity_index() -> pl.DataFrame:
-    """Arterial bottlenecks grouped by physical intersection (representative_
-    intersection) so a location that congests in both directions — or where
-    a cross corridor was independently analyzed — reads as one combined
-    score instead of competing with itself as separate directional entries.
-    Only ranking_eligible bottlenecks contribute; see
-    sql/008_intersection_severity_index.sql."""
-    return pl.read_database_uri(
-        query='SELECT * FROM "Year_2025".vw_intersection_severity_index ORDER BY intersection_severity_rank',
-        uri=cbi_database.database_uri(),
-        engine="connectorx",
-    )
+def _load_arterial_delay_density() -> pl.DataFrame:
+    """Estimated Annual Vehicle-Hours of Delay (EAVHD) density ranking for
+    named arterial roads/paths (e.g. Buford Hwy, GA-42, N Druid Hills Rd) —
+    computed by the standalone cbi_arterial_intersection_severity.py
+    analysis (FHWA PHED-anchored; see that script's module docstring for
+    the full methodology: length-weighted recurrence/speed-ratio, a
+    corridor-eligibility rule, HDF sensitivity testing). This report only
+    reads the already-populated results table; run that script first to
+    (re)compute them. Returns an empty frame if the table doesn't exist
+    yet (fresh database, that script never run)."""
+    try:
+        return pl.read_database_uri(
+            query='SELECT * FROM "Year_2025".arterial_intersection_severity ORDER BY rank',
+            uri=cbi_database.database_uri(), engine="connectorx",
+        )
+    except Exception:
+        return pl.DataFrame()
 
 
-def _build_intersection_severity_tab_html(
-    intersections: pl.DataFrame, bottleneck_segments: pl.DataFrame
+def _load_arterial_rank_stability() -> pl.DataFrame:
+    try:
+        return pl.read_database_uri(
+            query='SELECT * FROM "Year_2025".arterial_severity_rank_stability ORDER BY hdf_variant',
+            uri=cbi_database.database_uri(), engine="connectorx",
+        )
+    except Exception:
+        return pl.DataFrame()
+
+
+def _load_arterial_map_segments() -> pl.DataFrame:
+    try:
+        return pl.read_database_uri(
+            query='SELECT * FROM "Year_2025".arterial_intersection_severity_segments',
+            uri=cbi_database.database_uri(), engine="connectorx",
+        )
+    except Exception:
+        return pl.DataFrame()
+
+
+def _build_arterial_delay_density_tab_html(
+    delay_density: pl.DataFrame, stability: pl.DataFrame, map_segments: pl.DataFrame
 ) -> str:
-    if intersections.is_empty():
-        return "<p class='muted'>No intersection-level data available yet.</p>"
+    if delay_density.is_empty():
+        return (
+            "<p class='muted'>No arterial delay-density data available yet — run "
+            "cbi_arterial_intersection_severity.py, then regenerate this report.</p>"
+        )
 
-    # Same segment-layer treatment as the Region Map tab (bottleneck extents
-    # colored by K-means-clustered, AADT-weighted severity on the Google
-    # Maps traffic ramp), just filtered to the Arterial-group bottlenecks
-    # that actually feed the intersection index — real road geometry, not
-    # a schematic point marker per intersection.
-    arterial_segments = bottleneck_segments.filter(pl.col("corridor_group") == "Arterial")
-    segment_records, legend = _bottleneck_records_and_legend(arterial_segments)
+    top = delay_density.row(0, named=True)
+    avg_drop = (1 - delay_density["speed_drop_ratio"]).mean() * 100
+    avg_occurrence = delay_density["occurrence_pct"].mean()
+
+    stats_html = f"""
+    <div class="kpi-row">
+      <div class="kpi-card"><div class="label">Most Concentrated Road</div>
+        <div class="value">{html.escape(str(top['arterial_group']))}</div>
+        <div class="sub">{top['road_miles']:.1f} mi &middot; {top['tmc_count']} TMCs &middot; AADT {top['aadt']:,.0f}</div></div>
+      <div class="kpi-card"><div class="label">Its Est. Annual Vehicle-Hrs Delay / Mile</div>
+        <div class="value">{top['eavhd_density']:,.0f}</div>
+        <div class="sub">{top['eavhd_total']:,.0f} total across the road</div></div>
+      <div class="kpi-card"><div class="label">Its Congestion Pattern</div>
+        <div class="value">{html.escape(str(top['congestion_pattern']))}</div>
+        <div class="sub">INRIX-observed shape, diagnostic only</div></div>
+      <div class="kpi-card"><div class="label">Avg Speed Reduction (Top {delay_density.height})</div>
+        <div class="value">{avg_drop:.1f}%</div>
+        <div class="sub">Avg recurrence {avg_occurrence:.1f}%</div></div>
+    </div>
+    """
+
+    # Same real-per-TMC-road-curve technique and canvas map engine as the
+    # Region Map tab. Color is a K-means fit (cbi_map_geometry.
+    # kmeans_severity_classes) scoped to just these ranked roads' EAVHD
+    # density, not the full named-arterial candidate pool — fitting on the
+    # full pool would collapse the displayed set into one color, the same
+    # selection-vs-symbology issue documented elsewhere in this report.
+    ranks, legend = cbi_map_geometry.kmeans_severity_classes(delay_density["eavhd_density"].to_list())
+    tier_by_group = dict(zip(delay_density["arterial_group"].to_list(), ranks))
+
+    polylines = cbi_map_geometry.load_tmc_polylines()
+    map_records: list[list] = []
+    if not map_segments.is_empty():
+        for row in map_segments.iter_rows(named=True):
+            tier = tier_by_group.get(row["arterial_group"])
+            if tier is None:
+                continue
+            points = cbi_map_geometry.offset_points(
+                cbi_map_geometry.resolve_points(
+                    row["tmc_code"], row["start_latitude"], row["start_longitude"],
+                    row["end_latitude"], row["end_longitude"], polylines,
+                )
+            )
+            color = cbi_map_geometry.BOTTLENECK_SEVERITY_COLORS[tier]
+            direction_abbrev = cbi_map_geometry.abbreviate_direction(row["direction"])
+            map_records.append(
+                [
+                    points, color, 3.2, None,
+                    {
+                        "name": f"#{row['road_rank']} {row['arterial_group']} {direction_abbrev}",
+                        "severity": float(row["eavhd_hours"]),
+                    },
+                ]
+            )
 
     map_html = _canvas_map_html(
-        segments=segment_records, height=560, width=1180, interactive=True,
+        map_records, height=620, width=1180, interactive=True,
         county_rings=_load_county_boundary_rings(), responsive=True,
     )
-    severity_items = "".join(
-        f"<div class='map-legend-item'><span class='swatch dot' style='background:{color}'></span>{label}</div>"
+    legend_items = "".join(
+        f"<div class='map-legend-item'><span class='swatch dot' style='background:{color}'></span>"
+        f"EAVHD {label} veh-hrs/mi</div>"
         for color, label in legend
     )
     map_with_legend = f"""
     <div class='map-with-legend'>
       <div class='map-explain'>
         <h4>Reading this map</h4>
-        <p>Colored segments are the exact bottleneck extents contributing to each intersection's
-        score — same real road geometry, same Google Maps-style traffic ramp, and same K-means
-        classing as the Region Map tab, so the two are directly comparable at a glance.</p>
-        <p>Only Arterial-road bottlenecks that passed the overnight-congestion false-flag check
-        are included (see the Metadata tab) — Interstates and Expressways don't have
-        signal-controlled cross intersections in this sense, so they're out of scope for this
-        specific view (they're still fully covered in Top Bottlenecks and the Region Map).</p>
+        <p>Every TMC segment belonging to a top-{delay_density.height} ranked road is drawn
+        along its real road curve (same shapefile-derived geometry as the Region Map tab),
+        colored by that road's Estimated Annual Vehicle-Hours of Delay (EAVHD) density class.</p>
       </div>
       {map_html}
       <div class='map-legend'>
-        <h4>Intersection Severity<br/>(AADT-weighted, K-means clustered)</h4>
-        {severity_items}
+        <h4>EAVHD Density Classes<br/>(veh-hrs/mi, K-means)</h4>
+        {legend_items}
       </div>
     </div>
     """
 
-    header = (
-        "<tr><th>Rank</th><th>Intersection</th><th>Contributing Directions</th>"
-        "<th>Corridors</th><th>County</th><th>CID</th><th>Max AADT</th><th>Avg Occurrence %</th>"
-        "<th>Total Annual Mile-Hrs</th><th>Avg Speed Ratio</th><th>Severity (geometric)</th>"
-        "<th>Severity (AADT-weighted)</th></tr>"
+    fig = go.Figure(
+        data=go.Scatter(
+            x=delay_density["eavhd_density"].to_list(),
+            y=(1 - delay_density["speed_drop_ratio"]).to_list(),
+            mode="markers+text",
+            text=[f"#{r}" for r in delay_density["rank"].to_list()],
+            textposition="top center",
+            marker=dict(
+                size=[8 + (o / 100 * 20) for o in delay_density["occurrence_pct"].to_list()],
+                color=delay_density["occurrence_pct"].to_list(),
+                colorscale=[[0, "#dce6f1"], [1, "#b8860b"]],
+                showscale=True,
+                colorbar=dict(title="Recurrence %"),
+                line=dict(width=1.5, color=INK_PRIMARY),
+            ),
+            hovertext=[
+                f"{row['arterial_group']}<br>"
+                f"Congestion pattern: {row['congestion_pattern']}<br>"
+                f"AADT: {row['aadt']:,.0f}<br>"
+                f"Road length: {row['road_miles']:.1f} mi ({row['tmc_count']} TMCs)<br>"
+                f"Est. annual vehicle-hrs delay (density): {row['eavhd_density']:,.0f}/mi<br>"
+                f"Est. annual vehicle-hrs delay (total): {row['eavhd_total']:,.0f}<br>"
+                f"Speed reduction: {(1 - row['speed_drop_ratio']) * 100:.1f}%<br>"
+                f"Recurrence: {row['occurrence_pct']:.1f}%<br>"
+                f"Max single-TMC share of delay: {row['max_tmc_eavhd_share']:.1%}"
+                f"{' (QC: high concentration)' if row['qc_high_concentration'] else ''}"
+                for row in delay_density.iter_rows(named=True)
+            ],
+            hoverinfo="text",
+        )
     )
-    rows = "".join(
-        f"<tr>"
-        f"<td>{row['intersection_severity_rank']}</td>"
-        f"<td>{html.escape(str(row['representative_intersection'] or ''))}</td>"
-        f"<td>{row['contributing_bottlenecks']}</td>"
-        f"<td>{html.escape(str(row['corridors']))}</td>"
-        f"<td>{html.escape(str(row['county'] or '-'))}</td>"
-        f"<td>{html.escape(str(row['cid_name'] or '-'))}</td>"
-        f"<td>{row['max_contributing_aadt'] or '-'}</td>"
-        f"<td>{_fmt2(row['avg_occurrence_pct'])}%</td>"
-        f"<td>{_fmt2(row['total_annual_queue_mile_hours'])}</td>"
-        f"<td>{_fmt2(row['avg_congested_speed_ratio'])}</td>"
-        f"<td>{_fmt2(row['intersection_severity_index'])}</td>"
-        f"<td>{_fmt2(row['aadt_weighted_intersection_severity_index'])}</td>"
-        "</tr>"
-        for row in intersections.iter_rows(named=True)
+    fig.update_layout(
+        title=dict(text="EAVHD Density vs. Speed Reduction", font=dict(color=INK_PRIMARY, size=15)),
+        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE,
+        font=dict(color=INK_SECONDARY, family="system-ui, -apple-system, 'Segoe UI', sans-serif"),
+        height=460, width=1180,
+        xaxis=dict(title="Estimated annual vehicle-hours of delay per mile", gridcolor=GRID, linecolor=GRID),
+        yaxis=dict(title="Speed reduction below free flow", tickformat=".0%", gridcolor=GRID, linecolor=GRID),
+    )
+    chart_card = _chart_card(
+        fig,
+        "Bubble size and color both track recurrence — how consistently each road runs "
+        "congested — while position shows delay density (x) against how much speed drops (y).",
     )
 
+    header = (
+        "<tr><th>Rank</th><th>Road</th><th>Worst Point</th><th>County</th>"
+        "<th>Congestion Pattern</th><th>Miles</th><th>TMCs</th><th>AADT</th>"
+        "<th>Speed Reduction</th><th>Recurrence</th><th>Max TMC Share of Delay</th>"
+        "<th>Est. Annual Vehicle-Hrs Delay (total)</th><th>Est. Annual Vehicle-Hrs Delay (per mile)</th>"
+        "<th>Severity Index (experimental)</th></tr>"
+    )
+    rows = "".join(
+        "<tr>"
+        f"<td>{row['rank']}</td>"
+        f"<td>{html.escape(str(row['arterial_group']))}"
+        + (" <span title='Most delay concentrated in one TMC'>&#9888;</span>" if row['qc_high_concentration'] else "")
+        + "</td>"
+        f"<td>{html.escape(str(row['worst_intersection'] or ''))}</td>"
+        f"<td>{html.escape(str(row['county'] or '-'))}</td>"
+        f"<td>{html.escape(str(row['congestion_pattern']))}</td>"
+        f"<td>{row['road_miles']:.1f}</td>"
+        f"<td>{row['tmc_count']}</td>"
+        f"<td>{row['aadt']:,.0f}</td>"
+        f"<td>{(1 - row['speed_drop_ratio']) * 100:.1f}%</td>"
+        f"<td>{row['occurrence_pct']:.1f}%</td>"
+        f"<td>{row['max_tmc_eavhd_share']:.1%}</td>"
+        f"<td>{row['eavhd_total']:,.0f}</td>"
+        f"<td>{row['eavhd_density']:,.0f}</td>"
+        f"<td>{row['severity_index']:.1f}</td>"
+        "</tr>"
+        for row in delay_density.iter_rows(named=True)
+    )
+
+    stability_html = ""
+    if not stability.is_empty():
+        stability_rows = "".join(
+            f"<li>vs. the <strong>{html.escape(str(row['hdf_variant']))}</strong> scenario: "
+            f"Spearman rank correlation <strong>{row['spearman_correlation']:.2f}</strong>, "
+            f"<strong>{row['top_n_overlap']}/{row['top_n']}</strong> of the same roads remain in the top "
+            f"{row['top_n']}</li>"
+            for row in stability.iter_rows(named=True)
+        )
+        stability_html = f"""
+        <p class="map-legend-note"><strong>Rank stability (validation output):</strong> EAVHD
+        density was recomputed under 3 alternate hourly-distribution scenarios and compared to
+        the ranking above — see the Metadata tab for the full methodology.</p>
+        <ul>{stability_rows}</ul>
+        """
+
     return f"""
-    <h3 class="section-title">Intersection Severity Index — Arterial Roads</h3>
-    <p class="muted">The Top Bottlenecks tab ranks individual, per-direction bottlenecks. This
-    combines bottlenecks that share the same physical intersection across directions or
-    corridors into a single location-level score, restricted to Arterial roads and to
-    bottlenecks not already excluded by the overnight-congestion false-flag check — so an
-    intersection genuinely congested in both directions ranks above one that only looks bad in a
-    single direction, without artifacts inflating the score. <strong>CID</strong> is the
-    Community Improvement District (ARC Open Data, region-wide) the intersection's peak segment
-    falls within, shown as '-' outside every CID boundary.</p>
+    <h3 class="section-title">Top Arterials by Estimated Vehicle-Delay Density</h3>
+    <p class="muted">Ranks named arterial roads/paths (e.g. Buford Hwy, GA-42, N Druid Hills Rd)
+    by Estimated Annual Vehicle-Hours of Delay per mile (EAVHD density) — a congestion-
+    CONCENTRATION measure, not total regional burden. See the Metadata tab for the full
+    methodology, including why "Estimated," the corridor-eligibility rule, and the recurrence
+    calculation.</p>
+    {stats_html}
     <div class="card map-card">{map_with_legend}</div>
-    <p class="map-legend-note"><strong>Occurrence caution:</strong> On signalized corridors,
-    occurrence includes sustained low-speed observations associated with normal signal-cycle
-    operation as well as demand-driven queueing. A 100% occurrence value should therefore not be
-    interpreted as continuous or abnormal congestion on every analyzed day. See Methodology for
-    details.</p>
-    <h3 class="section-title">Ranked Intersections ({intersections.height})</h3>
+    {chart_card}
+    <h3 class="section-title">Ranked Arterials ({delay_density.height})</h3>
     <table class="data">{header}{rows}</table>
+    {stability_html}
     """
 
 
@@ -2152,7 +2443,7 @@ def _build_top_bottlenecks_tab_html(rankings: pl.DataFrame) -> str:
         f"""<div class='bottleneck-card'>
               <div class='rank'>#{row['network_severity_rank']}</div>
               <div class='body'>
-                <div class='name'>{html.escape(str(row['representative_intersection'] or ''))}</div>
+                <div class='name'>{html.escape(_location_label(row['representative_intersection'], row['corridor_name']))}</div>
                 <div class='corridor'>{html.escape(str(row['corridor_name']))}
                   &middot; {html.escape(str(row['county'] or 'unknown county'))} County</div>
                 <div class='desc'>Analytics show that this segment experiences congestion on
@@ -2178,7 +2469,7 @@ def _build_top_bottlenecks_tab_html(rankings: pl.DataFrame) -> str:
     rows = "".join(
         f"<tr class='{'top10' if row['network_severity_rank'] <= 10 else ''}'>"
         f"<td>{row['network_severity_rank']}</td>"
-        f"<td>{html.escape(str(row['representative_intersection'] or ''))}</td>"
+        f"<td>{html.escape(_location_label(row['representative_intersection'], row['corridor_name']))}</td>"
         f"<td>{html.escape(str(row['corridor_name']))}</td>"
         f"<td>{html.escape(str(row['corridor_group']))}</td>"
         f"<td>{html.escape(str(row['county'] or '-'))}</td>"
@@ -2200,7 +2491,10 @@ def _build_top_bottlenecks_tab_html(rankings: pl.DataFrame) -> str:
     corridors, ranked region-wide by AADT-weighted severity (geometric severity index — occurrence
     &times; annual queue mile-hours &times; speed drop — scaled by peak-segment traffic volume
     relative to the region's typical bottleneck; see the Metadata tab for the full methodology and
-    why volume weighting was added). The top 10 are highlighted below and in the full list.</p>
+    why volume weighting was added). The top 10 are highlighted below and in the full list. Downtown
+    Connector Northbound and Southbound each appear as a single row here despite spanning many named
+    exits — for more detail on their individual exit-by-exit congestion, see the Corridors
+    section.</p>
     <div class="bottleneck-spotlight">{spotlight_cards}</div>
     <h3 class="section-title">Full Regional Ranking ({rankings.height} bottlenecks)</h3>
     <table class="data">{header}{rows}</table>
@@ -2242,9 +2536,7 @@ def generate_regional_report(
 
     # --- Top Bottlenecks tab --------------------------------------------------
     bottleneck_rankings = _load_regional_bottleneck_rankings()
-    intersection_severity = _load_intersection_severity_index()
     top_bottlenecks_html = _build_top_bottlenecks_tab_html(bottleneck_rankings)
-    intersection_severity_html = _build_intersection_severity_tab_html(intersection_severity, bottleneck_segments)
 
     # --- General tab -------------------------------------------------------
     month_labels = [d.strftime("%b %Y") for d in monthly["month"].to_list()]
@@ -2418,6 +2710,25 @@ def generate_regional_report(
         else ""
     )
 
+    # --- Top Arterials by Estimated Vehicle-Delay Density tab (last tab) ------
+    # Built LAST, after every other _fig_html()/chart_card() call above, and
+    # deliberately not earlier: _fig_html() only inlines the full plotly.js
+    # library once, for whichever figure happens to be rendered FIRST
+    # (_FIG_COUNTER == 0) — and that figure must also be the first one that
+    # actually appears in the assembled document, since browsers execute
+    # <script> tags in document order. This tab is the LAST one in the nav,
+    # so its own scatter-chart script must also be the LAST Plotly figure
+    # built in Python, or every earlier chart's script runs before the
+    # library-bearing one has loaded (confirmed directly: building this
+    # block up near the top of the function, before general_html's charts,
+    # broke every chart on the page except this tab's own).
+    arterial_delay_density = _load_arterial_delay_density()
+    arterial_rank_stability = _load_arterial_rank_stability()
+    arterial_map_segments = _load_arterial_map_segments()
+    arterial_delay_density_html = _build_arterial_delay_density_tab_html(
+        arterial_delay_density, arterial_rank_stability, arterial_map_segments
+    )
+
     generated_on = date.today().isoformat()
     logo_uri = _agency_logo_data_uri()
     logo_html = (
@@ -2436,25 +2747,32 @@ def generate_regional_report(
 <script>{_CANVAS_MAP_JS}</script>
 <header class="masthead">
   {logo_html}
-  <h1>CBI: Congestion and Bottleneck Identification</h1>
+  <div>
+    <h1>CBI: Congestion and Bottleneck Identification</h1>
+    <p style="margin:2px 0 0 0; font-size:13px;">
+      <a href="CBI_Technical_Report.pdf" target="_blank" rel="noopener noreferrer" style="color:#cfe0ff;">CBI Technical Report (PDF)</a>
+      &nbsp;&middot;&nbsp;
+      <a href="Intersection_Congestion_Ranking.pdf" target="_blank" rel="noopener noreferrer" style="color:#cfe0ff;">Intersection Congestion Ranking (PDF)</a>
+    </p>
+  </div>
 </header>
 <nav class="tabs">
   <button class="active" data-tab="tab-metadata" onclick="showTab('tab-metadata')">Metadata</button>
   <button data-tab="tab-general" onclick="showTab('tab-general')">Regional Overview</button>
   <button data-tab="tab-map" onclick="showTab('tab-map')">Region Map</button>
   <button data-tab="tab-bottlenecks" onclick="showTab('tab-bottlenecks')">Top Bottlenecks</button>
-  <button data-tab="tab-intersections" onclick="showTab('tab-intersections')">Intersection Severity</button>
   <button data-tab="tab-corridors" onclick="showTab('tab-corridors')">Corridors</button>
   {watch_tab_button}
+  <button data-tab="tab-arterial-delay" onclick="showTab('tab-arterial-delay')">Top Arterials</button>
 </nav>
 <main>
   <section id="tab-metadata" class="tabpanel active">{metadata_html}</section>
   <section id="tab-general" class="tabpanel">{general_html}</section>
   <section id="tab-map" class="tabpanel">{region_map_html}</section>
   <section id="tab-bottlenecks" class="tabpanel">{top_bottlenecks_html}</section>
-  <section id="tab-intersections" class="tabpanel">{intersection_severity_html}</section>
   <section id="tab-corridors" class="tabpanel">{corridors_html}</section>
   {watch_tab_section}
+  <section id="tab-arterial-delay" class="tabpanel">{arterial_delay_density_html}</section>
 </main>
 <footer>Data source: NPMRDS from INRIX (passenger vehicles and trucks), 21 Georgia counties,
   17,388 TMC segments, weekdays (Mon&ndash;Fri) Jan 1&ndash;Dec 31, 2025. Bottleneck-detection
@@ -2506,7 +2824,11 @@ def _corridor_detail_block(
     all_bottleneck_records: list[list],
     output_root: Path,
 ) -> str:
-    ranked = _load_ranked_bottlenecks_detailed(corridor)
+    ranked = (
+        _load_ranked_segments_by_intersection(corridor)
+        if corridor.corridor_name in _MULTI_BOTTLENECK_CORRIDORS
+        else _load_ranked_bottlenecks_detailed(corridor)
+    )
     summary = _load_corridor_summary(corridor)
     from_intersection, to_intersection = _load_corridor_extent(corridor)
 
@@ -2586,6 +2908,6 @@ def _corridor_detail_block(
       measure than the Region Map's color, which shows only how often each segment congests.
       This corridor's mini-map is colored by that same occurrence rate for comparison.</p>
       <div class="chart-grid">{chart_html}</div>
-      {_bottleneck_table(ranked)}
+      {_bottleneck_table(ranked, corridor.corridor_name)}
     </div>
     """
